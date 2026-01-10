@@ -1,3 +1,6 @@
+import importlib
+from typing import Dict, List, Union
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -21,14 +24,14 @@ class MNISTDataset(Dataset):
         return image, target, torch.tensor(labels, dtype=torch.float32)
     
 
-def get_mnist(batch_size: int = 32, path: str = '../data/') -> DataLoader | DataLoader:
+def get_mnist(path: str = '../data/') -> DataLoader | DataLoader:
     """Get the MNIST training and testing data loaders.
 
     Args:
         batch_size (int, optional): Defaults to 32.
 
     Returns:
-        DataLoader | DataLoader: Training and testing data loaders
+        Dataset | Dataset: Training and testing datasets
     """
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
     train_dataset = datasets.MNIST(root=path, train=True, download=True, transform=transform)
@@ -37,12 +40,36 @@ def get_mnist(batch_size: int = 32, path: str = '../data/') -> DataLoader | Data
     train_noisy_dataset = MNISTDataset(train_dataset)
     test_noisy_dataset = MNISTDataset(test_dataset)
 
-    train_loader = DataLoader(train_noisy_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_noisy_dataset, batch_size=batch_size, shuffle=True)
-
-    return train_loader, test_loader
+    return train_noisy_dataset, test_noisy_dataset
 
 
 def add_noise(x, noise_factor):
     noisy_x =  (1-noise_factor)*x + noise_factor * torch.randn(x.size())
     return noisy_x
+
+def get_device(devices: List[str] = ["xpu", "cuda", "mps", "cpu"]):
+    """
+    Get the first available device from devices list.
+    """
+    for device in devices:
+        try:
+            device_module = importlib.import_module(f"torch.{device}")
+        except ModuleNotFoundError:
+            device_module = None
+        if getattr(device_module, "is_available", lambda: False)():
+            break
+
+    return device
+
+def get_device_type(device: Union[str, torch.device]):
+    """
+    Get string indicating device type of device.
+    """
+    return (device.type if isinstance(device, torch.device) else device)
+
+def get_backend(device: Union[str, torch.device], backends: Dict[str, str] = {
+    "cpu": "gloo", "cuda": "nccl", "mps": "", "xpu": "xccl"}):
+    """
+    For specified device, get distributed-processing backend.
+    """
+    return backends.get(get_device_type(device), None)

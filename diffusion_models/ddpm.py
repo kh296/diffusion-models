@@ -1,11 +1,22 @@
+import importlib
+import os
+from socket import gethostname
+
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.optim as optim
 from tqdm import tqdm
 
+from diffusion_models.utils import get_device_type, get_backend
 
 class DDPM:
-    def __init__(self, model, optimizer, T: int, start: float, end: float, device: torch.device = torch.device('cpu')):
+    def __init__(self, model, optimizer, T: int, start: float, end: float,
+                 device: torch.device = torch.device('cpu'),
+                 ntasks_per_node: int = -1,
+                 cpus_per_task: int = 1,
+                 dist_url: str = "127.0.0.1",
+                 dist_port: str = "55100"):
         """DDPM Scheduler
 
         Args:
@@ -14,10 +25,50 @@ class DDPM:
             start (float): Smallest variance
             end (float): Largest variance
             device (torch.device, optional): Device. Defaults to torch.device('cpu')
+            ntasks_per_node (int, optional): Number of tasks per node for distributed processing; -1 for number of tasks equal to number of devices on node
+            cpus_per_task (int, optional): Number of CPUs per task
+            dist_url (str, optional): URL used to set up distributed training
+            dist_port (str, optional): Port used to set up distributed training
         """
         self.optimizer = optimizer
-        self.device = device
-        self.model = model.to(self.device)
+        self.dist_url = dist_url
+        self.dist_port = dist_port
+
+        device_type = get_device_type(device)
+        try:
+            device_module = importlib.import_module(f"torch.{device_type}")
+        except ModuleNotFoundError:
+            print(f"Torch module not found for device type '{device_type}'"
+                  " - falling back to 'cpu'")
+            device_module = None
+        if device_module is not None:
+            if not (getattr(device_module, "is_available", lambda: False)()):
+                print(f"Device type '{device_type}' not available"
+                      " - falling back to 'cpu'")
+                device_module = None
+        if device_module is None:
+            device_type = "cpu"
+            device_module = importlib.import_module("torch.cpu")
+
+        if -1 == ntasks_per_node:
+            ntasks_per_node = device_module.device_count()
+
+        self.world_size = int(os.environ.get("PMI_SIZE", 1))
+        self.rank = int(os.environ.get("PMI_RANK", 0))
+        local_rank = (
+                self.rank - ntasks_per_node * (self.rank // ntasks_per_node))
+        self.device = f"{device_type}:{local_rank}"
+        self.device_type = device_type
+        print(f"host+device: {gethostname()}+{self.device}, "
+                f"rank: {self.rank}, local_rank: {local_rank}, ", flush=True)
+
+        self.backend = get_backend(device_type)
+        if self.backend:
+            self.setup()
+            device_module.set_device(self.device)
+
+        model_on_device = model.to(self.device)
+        self.model = DDP(model_on_device) if self.backend else model_on_device
 
         self.T = T
         self.beta = torch.linspace(start, end, T).to(device)
@@ -27,7 +78,23 @@ class DDPM:
         self.sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar)
         self.noise_coefficient = (1 - alpha) / self.sqrt_one_minus_alpha_bar
         self.sqrt_alpha_inv = torch.sqrt(1 / alpha)
-        
+
+
+    def setup(self):
+        # initialize the process group
+        torch.distributed.init_process_group(
+            backend=self.backend,
+            init_method=f"tcp://{self.dist_url}:{self.dist_port}",
+            rank=self.rank,
+            world_size=self.world_size)
+        print(f"Added to process group: host: {gethostname()}, "
+                f"rank: {self.rank}, world_size: {self.world_size}", flush=True)
+
+
+    def teardown(self):
+        if self.backend:
+            torch.distributed.destroy_process_group()
+
 
     def forward(self, x_0: torch.Tensor, t: float) -> torch.Tensor | torch.Tensor:
         """The forward diffusion process
@@ -122,22 +189,36 @@ class DDPM:
         return per_sample_loss.mean()
 
 
-    def train(self, train_loader, epochs: int = 10) -> tuple[list[float], list[float]]:
+    def train(self, train_dataset, epochs: int = 10, batch_size: int = 32) -> tuple[list[float], list[float]]:
         """Train the model
 
         Args:
-            train_loader (DataLoader): Training data loader
+            train_dataset (DataLoader): Dataset for training.
             epochs (int, optional): Defaults to 10.
+            batch_size (int, optional): Defaults to 32.
 
         Returns:
             tuple[list[float], list[float]]: Returns (losses, t_values)
         """
         losses = []
         t_values = []
+
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank)
+
+        train_kwargs = {"batch_size": batch_size}
+        if self.device_type in ["cuda", "xpu"]:
+            train_kwargs["num_workers"] = cpus_per_task
+            train_kwargs["pin_memory"] = True
+
+        train_loader = torch.utils.data.DataLoader(train_dataset,
+                                                   sampler=train_sampler,
+                                                   **train_kwargs)
         
         for epoch in range(epochs):
             running_loss = 0
-            batch_size = train_loader.batch_size
             for images, targets, labels in tqdm(train_loader, desc='Training', total=len(train_loader)):
                 images, targets, labels = images.to(self.device), targets.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
