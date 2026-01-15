@@ -1,7 +1,7 @@
 venv/
 docs/.DS_Store
 /notebooks/data/
-/notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
 /notebooks/model.pth
 /notebooks/model_bigger.pth
 
