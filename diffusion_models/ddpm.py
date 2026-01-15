@@ -1,6 +1,13 @@
+from datetime import timedelta
 import importlib
+import logging
+import math
 import os
 from socket import gethostname
+import subprocess
+import time
+import traceback
+from typing import List, Union
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +23,17 @@ class DDPM:
                  ntasks_per_node: int = -1,
                  cpus_per_task: int = 1,
                  dist_url: str = "127.0.0.1",
-                 dist_port: str = "55100"):
+                 dist_port: str = "55100",
+                 checkpoint_in: str = "",
+                 checkpoint_out: str = "",
+                 checkpoint_interval: int = 1,
+                 log_level: str = "info",
+                 log_interval: int = 1,
+                 log_ranks: List[int] = [],
+                 use_tqdm: bool = True,
+                 cancel_on_exception = False,
+                 timeout: Union[int, float, timedelta] = timedelta(minutes=5),
+                 ):
         """DDPM Scheduler
 
         Args:
@@ -29,21 +46,46 @@ class DDPM:
             cpus_per_task (int, optional): Number of CPUs per task
             dist_url (str, optional): URL used to set up distributed training
             dist_port (str, optional): Port used to set up distributed training
+            checkpoint_in (str, optional): Path to file from which to load checkpoint data
+            checkpoint_out (str, optional): Path to file to which to save checkpoint data
+            checkpoint_interval (int, optional): Number of epochs to wait before saving checkpoint data
+            log_level (str, optional): Level for message logging
+            log_interval (int, optional): Number of epochs to wait before logging training status
+            log_ranks (List[int], optional): Ranks for which logging is to be performed
+            use_tqdm (bool, optional): Indicate whether to use tqdm to show progress during training and sampling
+            cancel_on_exception (bool, optional): Indicate whether to check for Slurm job id and cancel in case of exception
+            timeout (Union[int, float, datetime.timedelta], optional): Timeout for distributed communication - in seconds if int or float  
         """
+        logging.basicConfig(format="[{name}_{levelname}] {message}", style="{")
+        self.logger = logging.getLogger(name=type(self).__name__)
+        self.logger.setLevel(log_level.upper())
         self.optimizer = optimizer
+        self.cpus_per_task = cpus_per_task
         self.dist_url = dist_url
         self.dist_port = dist_port
+        self.checkpoint_in = checkpoint_in
+        self.checkpoint_out = checkpoint_out
+        self.checkpoint_interval = checkpoint_interval
+        self.losses = []
+        self.t_values = []
+        self.log_interval = log_interval
+        self.log_ranks = log_ranks
+        self.use_tqdm = use_tqdm
+        self.cancel_on_exception = cancel_on_exception
+        self.job_id = os.getenv("SLURM_JOB_ID")
+        self.timeout = (timeout if isinstance(timeout, timedelta)
+                else timedelta(seconds=timeout))
 
         device_type = get_device_type(device)
         try:
             device_module = importlib.import_module(f"torch.{device_type}")
         except ModuleNotFoundError:
-            print(f"Torch module not found for device type '{device_type}'"
+            self.logger.warning(f"Torch module not found for device type '{device_type}'"
                   " - falling back to 'cpu'")
             device_module = None
         if device_module is not None:
             if not (getattr(device_module, "is_available", lambda: False)()):
-                print(f"Device type '{device_type}' not available"
+                self.logger.warning(f"Device type '{device_type}' not available"
                       " - falling back to 'cpu'")
                 device_module = None
         if device_module is None:
@@ -55,19 +97,39 @@ class DDPM:
 
         self.world_size = int(os.environ.get("PMI_SIZE", 1))
         self.rank = int(os.environ.get("PMI_RANK", 0))
-        local_rank = (
+        self.local_world_size = ntasks_per_node
+        self.local_rank = (
                 self.rank - ntasks_per_node * (self.rank // ntasks_per_node))
-        self.device = f"{device_type}:{local_rank}"
+        self.device = (device_type if "cpu" == device_type
+                else f"{device_type}:{self.local_rank}")
         self.device_type = device_type
-        print(f"host+device: {gethostname()}+{self.device}, "
-                f"rank: {self.rank}, local_rank: {local_rank}, ", flush=True)
 
-        self.backend = get_backend(device_type)
+        self.backend = get_backend(device_type) if self.world_size > 1 else None
+        info = (f"host+device: {gethostname()}+{self.device}, "
+                f"world_size: {self.world_size}, "
+                f"rank: {self.rank}, local_rank: {self.local_rank}")
         if self.backend:
             self.setup()
+            info = f"{info} - initialised process group"
             device_module.set_device(self.device)
+        if self.rank in self.log_ranks or not self.log_ranks:
+            self.logger.info(info)
 
         model_on_device = model.to(self.device)
+        if self.checkpoint_in and os.path.isfile(self.checkpoint_in):
+            checkpoint = torch.load(self.checkpoint_in, map_location=self.device)
+            model_on_device.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.start_epoch = 1 + checkpoint['epoch']
+            self.losses = checkpoint['losses']
+            self.t_values = checkpoint['t_values']
+            if 0 == self.rank:
+                self.logger.info(
+                        f"Loaded epoch {self.start_epoch} checkpoint data "
+                        f"from: {self.checkpoint_in}")
+        else:
+            self.start_epoch = 0
+            
         self.model = DDP(model_on_device) if self.backend else model_on_device
 
         self.T = T
@@ -80,15 +142,17 @@ class DDPM:
         self.sqrt_alpha_inv = torch.sqrt(1 / alpha)
 
 
-    def setup(self):
-        # initialize the process group
+    def setup(self): 
+        # Initialize the process group.
         torch.distributed.init_process_group(
             backend=self.backend,
             init_method=f"tcp://{self.dist_url}:{self.dist_port}",
             rank=self.rank,
-            world_size=self.world_size)
-        print(f"Added to process group: host: {gethostname()}, "
-                f"rank: {self.rank}, world_size: {self.world_size}", flush=True)
+            world_size=self.world_size,
+            device_id=self.local_rank,
+            timeout=self.timeout,
+            )
+        return
 
 
     def teardown(self):
@@ -152,7 +216,8 @@ class DDPM:
         labels[torch.arange(batch_size), label] = 1
 
         x_ts = []
-        for i in tqdm(range(0, self.T)[::-1]):
+        source = range(0, self.T)[::-1]
+        for i in (tqdm(source) if self.use_tqdm else source):
             t = torch.full((batch_size,), i).to(self.device)
             # t = t.float()
             epsilon_t = self.model(x_t, t.float(), labels)
@@ -200,26 +265,33 @@ class DDPM:
         Returns:
             tuple[list[float], list[float]]: Returns (losses, t_values)
         """
-        losses = []
-        t_values = []
-
         train_sampler = torch.utils.data.distributed.DistributedSampler(
                 train_dataset,
                 num_replicas=self.world_size,
-                rank=self.rank)
+                rank=self.rank,
+                shuffle=True,
+                )
 
         train_kwargs = {"batch_size": batch_size}
         if self.device_type in ["cuda", "xpu"]:
-            train_kwargs["num_workers"] = cpus_per_task
+            train_kwargs["num_workers"] = self.cpus_per_task
             train_kwargs["pin_memory"] = True
 
         train_loader = torch.utils.data.DataLoader(train_dataset,
                                                    sampler=train_sampler,
                                                    **train_kwargs)
         
-        for epoch in range(epochs):
+        end_epoch = self.start_epoch + epochs
+        for epoch in range(self.start_epoch, end_epoch):
+            epoch_plus_one = epoch + 1
+            if self.backend:
+                torch.distributed.barrier()
+            t0 = time.time()
             running_loss = 0
-            for images, targets, labels in tqdm(train_loader, desc='Training', total=len(train_loader)):
+            source = (tqdm(
+                train_loader, desc='Training', total=len(train_loader))
+                if self.use_tqdm else train_loader)
+            for images, targets, labels in source:
                 images, targets, labels = images.to(self.device), targets.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
                 t = torch.randint(0, self.T, (images.shape[0],), device=self.device)
@@ -229,14 +301,70 @@ class DDPM:
                 loss_per_sample = self.loss_function(images, t, labels, return_per_sample=True)  # You'll need to modify loss_function
                 batch_loss = loss_per_sample.mean()  # For backward pass
                 
-                batch_loss.backward()
+                try:
+                    batch_loss.backward()
+                except RuntimeError as e:
+                    if self.cancel_on_exception and self.job_id:
+                        self.cancel(traceback.format_exc())
+                    else:
+                        raise RuntimeError(traceback.format_exc())
                 self.optimizer.step()
 
                 running_loss += batch_loss.item()
+                if math.isnan(running_loss):
+                    msg = (f"Epoch {epoch_plus_one}, "
+                            f"rank {self.rank} - running_loss is nan")
+                    if self.cancel_on_exception and self.job_id:
+                        self.cancel(msg)
+                    else:
+                        raise RuntimeError(msg)
+
                 # Extend both lists with per-sample values
-                losses.extend(loss_per_sample.detach().cpu().numpy().tolist())
-                t_values.extend(t.cpu().numpy().tolist())
+                self.losses.extend(
+                        loss_per_sample.detach().cpu().numpy().tolist())
+                self.t_values.extend(t.cpu().numpy().tolist())
 
-            print(f'Epoch [{epoch+1}/{epochs}], Loss: {running_loss/len(train_loader):.4f}')
+            t1 = time.time()
+            if self.backend:
+                torch.distributed.barrier()
+            if (epoch_plus_one % self.log_interval == 0
+                    or epoch_plus_one == end_epoch):
+                if self.rank in self.log_ranks or not self.log_ranks:
+                    self.logger.info(f'{gethostname()}+{self.device} - '
+                            f'Epoch: {epoch_plus_one}/{end_epoch}, '
+                            f'Time: {t1 - t0:.3f} s, '
+                            f'Images: {len(train_loader)}, '
+                            f'Loss: {running_loss/len(train_loader):.4f}')
 
-        return losses, t_values
+                if self.checkpoint_out:
+                    if self.backend:
+                        torch.distributed.barrier()
+                    if 0 == self.rank:
+                        checkpoint = {
+                                'epoch': epoch,
+                                'model_state_dict': (
+                                    self.model.module.state_dict()
+                                    if self.backend
+                                    else self.model.state_dict()),
+                                'optimizer_state_dict': (
+                                    self.optimizer.state_dict()),
+                                'losses': self.losses,
+                                't_values': self.t_values,
+                                }
+                        torch.save(checkpoint, self.checkpoint_out)
+                        self.logger.info(
+                                f'Saved epoch {epoch_plus_one} '
+                                f'checkpoint data to: {self.checkpoint_out}')
+                    if self.backend:
+                        torch.distributed.barrier()
+
+        return self.losses, self.t_values
+
+
+    def cancel(self, msg=""):
+        if self.cancel_on_exception and self.job_id:
+            self.logger.error(msg)
+            self.logger.error(f"Cancelling current job - id {self.job_id}")
+            subprocess.run(["scancel", self.job_id])
+        else:
+            raise RuntimeError(msg)
