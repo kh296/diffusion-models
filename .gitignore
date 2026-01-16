@@ -1,3 +1,4 @@
+envs/
 venv/
 docs/.DS_Store
 /notebooks/data/
