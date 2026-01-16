@@ -180,9 +180,9 @@ fi
  --dist-url ${DIST_URL}\
  --dist-port $(( (SLURM_JOB_ID % 10000) + 50000 ))\
  --cpus-per-task ${SLURM_CPUS_PER_TASK}\
- --epochs 1000\
+ --epochs 400\
  --checkpoint-in no_checkpoint.pt\
- --checkpoint-out checkpoint500.pt\
+ --checkpoint-out checkpoint400.pt\
  --checkpoint-interval 1\
  --log-interval 1\
  --lr 0.0002\
