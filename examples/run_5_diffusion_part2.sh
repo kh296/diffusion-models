@@ -207,7 +207,7 @@ echo "Import time 2: $((${SECONDS}-${T2})) seconds"
  --dist-url ${DIST_URL}\
  --dist-port $(( (SLURM_JOB_ID % 10000) + 50000 ))\
  --cpus-per-task ${SLURM_CPUS_PER_TASK}\
- --epochs 2\
+ --epochs 400\
  --checkpoint-in no_checkpoint.pt\
  --checkpoint-out checkpoint400.pt\
  --checkpoint-interval 1\
