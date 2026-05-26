@@ -1,4 +1,5 @@
 import importlib
+import os
 from typing import Dict, List, Union
 
 import numpy as np
@@ -23,12 +24,27 @@ class MNISTDataset(Dataset):
         
         return image, target, torch.tensor(labels, dtype=torch.float32)
     
-
-def get_mnist(path: str = '../data/') -> DataLoader | DataLoader:
+def get_mnist(batch_size: int = 32, path: str = '../data/') -> DataLoader | DataLoader:
     """Get the MNIST training and testing data loaders.
 
     Args:
         batch_size (int, optional): Defaults to 32.
+
+    Returns:
+        DataLoader | DataLoader: Training and testing data loaders
+    """
+    train_noisy_dataset, test_noisy_dataset = get_mnist_datasets(path)
+
+    train_loader = DataLoader(train_noisy_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_noisy_dataset, batch_size=batch_size, shuffle=True)
+
+    return train_loader, test_loader
+
+def get_mnist_datasets(path: str = '../data/') -> Dataset | Dataset:
+    """Get the MNIST training and testing datasets.
+
+    Args:
+        path (str, optional): Defaults to '../data/'.
 
     Returns:
         Dataset | Dataset: Training and testing datasets
@@ -41,7 +57,6 @@ def get_mnist(path: str = '../data/') -> DataLoader | DataLoader:
     test_noisy_dataset = MNISTDataset(test_dataset)
 
     return train_noisy_dataset, test_noisy_dataset
-
 
 def add_noise(x, noise_factor):
     noisy_x =  (1-noise_factor)*x + noise_factor * torch.randn(x.size())
@@ -73,3 +88,17 @@ def get_backend(device: Union[str, torch.device], backends: Dict[str, str] = {
     For specified device, get distributed-processing backend.
     """
     return backends.get(get_device_type(device), None)
+
+def get_int_from_env(env_vars: List[str] = [], default: int = 1) -> int:
+    """
+    Return first integer from environment variables in list env_vars.
+    If no variable set to an integer, return default.
+    """
+    for env_var in env_vars:
+        value = os.getenv(env_var)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                continue
+    return default

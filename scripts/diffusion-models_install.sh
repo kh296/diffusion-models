@@ -31,11 +31,15 @@
 # Exit at first failure.
 set -e
 
-ENV_NAME="diffusion-models"
+if [ -z "${ENV_NAME}" ]; then
+    ENV_NAME="diffusion-models"
+fi
 
 # Determine system being used.
 if [[ "$(hostname)" == "pvc-s"* ]]; then
     SYSTEM="Dawn"
+elif [[ "$(hostname)" == *"-pl1"* ]]; then
+    SYSTEM="aac6"
 elif [[ "${OSTYPE}" == "darwin"* ]]; then
     SYSTEM="macOS"
 else
@@ -58,9 +62,12 @@ if ! [ -d "${CONDA_HOME}" ]; then
     echo "Exiting: $(date)"
     exit 2
 fi
-#
+CONDA_HOME=$(echo "${CONDA_HOME//\'/~}" | sed "s|^~/|$HOME/|")
+CONDA_HOME=$(realpath "${CONDA_HOME}")
+
 # Perform installation.
 echo "Installation of ${ENV_NAME} for ${OSTYPE} on $(hostname) started: $(date)"
+echo ""
 T0=${SECONDS}
 
 # Create script for environment setup.
@@ -69,10 +76,13 @@ mkdir -p ${ENVS_DIR}
 SETUP="${ENVS_DIR}/${ENV_NAME}-setup.sh"
 DAWN_SETUP="/dev/null"
 MACOS_SETUP="/dev/null"
+AAC6_SETUP="/dev/null"
 if [[ "Dawn" == "${SYSTEM}" ]]; then
     DAWN_SETUP="${SETUP}"
 elif [[ "macOS" == "${SYSTEM}" ]]; then
     MACOS_SETUP="${SETUP}"
+elif [[ "aac6" == "${SYSTEM}" ]]; then
+    AAC6_SETUP="${SETUP}"
 fi
 
 cat <<EOF >${SETUP}
@@ -182,6 +192,21 @@ export GLOO_SOCKET_IFNAME="en0"
 
 EOF
 
+cat <<EOF >>${AAC6_SETUP}
+# Load modules.
+module purge
+module load rocm
+module load openmpi
+
+# Set network interface for communication:
+# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-socket-ifname
+# Possibilities for listing network interfaces include:
+# Linux: ip addr, netstat -i, ifconfig
+# MacOS: networksetup -listallhardwarereports, netstat -i, ifconfig
+export NCCL_SOCKET_IFNAME="enp129s0"
+
+EOF
+
 cat <<EOF >>${SETUP}
 # Initialise conda.
 source $(realpath ${CONDA_HOME})/bin/activate
@@ -194,9 +219,7 @@ source ${SETUP}
 conda update -n base -c conda-forge conda -y
 
 # Delete any pre-existing environment.
-if [ -d "${CONDA_HOME}/envs/${ENV_NAME}" ]; then
-    conda env remove -n ${ENV_NAME} -y
-fi
+rm -rf "${CONDA_HOME}/envs/${ENV_NAME}"
 
 # Create and activate the environment.
 conda create -n ${ENV_NAME} -y python=3.13
@@ -208,11 +231,14 @@ eval "${CMD}"
 python -m pip install --upgrade pip
 if [[ "Dawn" == "${SYSTEM}" ]]; then
     OPTS="--index-url https://download.pytorch.org/whl/xpu"
+elif [[ "aac6" == "${SYSTEM}" ]]; then
+    OPTS="--index-url https://download.pytorch.org/whl/rocm7.2"
 else
     OPTS=""
 fi
 # Includes constraints on fsspec version of datasets packages.
-pip install ${OPTS} fsspec\<=2025.10.0 torch==2.9.1 torchaudio==2.9.1 torchvision==0.24.1
+#pip install ${OPTS} fsspec\<=2025.10.0 torch==2.9.1 torchaudio==2.9.1 torchvision==0.24.1
+pip install ${OPTS} torch torchaudio torchvision
 pip install datasets diffusers ipykernel ipywidgets jupyterlab matplotlib scikit-learn seaborn transformers
 
 # Check installation by importing modules.

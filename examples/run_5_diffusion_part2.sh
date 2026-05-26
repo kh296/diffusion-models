@@ -4,7 +4,7 @@
 #SBATCH --partition=pvc9        # cluster partition to be used
 #SBATCH --nodes=2               # number of nodes
 #SBATCH --gres=gpu:4            # number of allocated gpus per node
-#SBATCH --time=01:00:00         # total run time limit (HH:MM:SS)
+#SBATCH --time=02:00:00         # total run time limit (HH:MM:SS)
 #
 # Script for running pytorch example,
 # based around diffusion models and MNIST dataset,
@@ -19,6 +19,11 @@
 # or can be submitted to a Slurm batch system, substituting
 # valid project account for <project_account>:.
 #     sbatch --acount=<project_account> run_5_diffusion_part2.sh
+#
+# Before running, or inside this script, the command used to perform
+# distributed processing may be chosen by setting the environment variable
+# LAUNCH_MODE to one of "mpiexec" (default), "srun", "torchrun".
+
 T1=${SECONDS}
 echo "Job start on $(hostname): $(date)"
 
@@ -54,7 +59,10 @@ if [[ ${WORKSHOP_HOME} == /var/spool/* ]]; then
     WORKSHOP_HOME=$(dirname $(pwd))
 fi
 
-SETUP_SCRIPT="${WORKSHOP_HOME}/envs/diffusion-models-setup.sh"
+if [ -z "${ENV_NAME}" ]; then
+    export ENV_NAME="diffusion-models"
+fi
+SETUP_SCRIPT="${WORKSHOP_HOME}/envs/${ENV_NAME}-setup.sh"
 SETUP="source ${SETUP_SCRIPT}"
 echo ""
 echo ${SETUP}
@@ -66,10 +74,10 @@ if [[ -z "${SLURM_NNODES}" ]]; then
 fi
 
 # Determine number of root devices per GPU on Dawn.
-if [[ "COMPOSITE" == ${ZE_FLAT_DEVICE_HIERARCHY} ]]; then
-    DEVICES_PER_GPU=1
-else
+if [[ "FLAT" == ${ZE_FLAT_DEVICE_HIERARCHY} ]]; then
     DEVICES_PER_GPU=2
+else
+    DEVICES_PER_GPU=1
 fi
 
 # Determine number of tasks per node, with one task per GPU root device,
@@ -94,6 +102,7 @@ if [[ -z "${SLURM_CPUS_ON_NODE}" ]]; then
     SLURM_CPUS_ON_NODE=1
 fi
 export SLURM_CPUS_PER_TASK=$((${SLURM_CPUS_ON_NODE}/${SLURM_NTASKS_PER_NODE}))
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}\
 
 # Ensure that value assigned to SLURM_JOB_NODELIST.
 if [[ -z "${SLURM_JOB_NODELIST}" ]]; then
@@ -120,6 +129,8 @@ else
     DIST_URL="127.0.0.1"
     DIST_URL="localhost"
 fi
+HOSTS=$(echo "${HOSTS}" | cut -d',' -f1-"${SLURM_NNODES}")
+DIST_PORT=$(( (SLURM_JOB_ID % 10000) + 50000 ))
 echo ""
 echo "Node(s) used:"
 echo "${HOSTS}"
@@ -127,50 +138,66 @@ echo "${HOSTS}"
 # Define launch commands, and perform initial module imports on each node.
 # (Initial imports can be slow.  They aren't essential here, and are performed
 # before running the application only so that so that the time for the initial
-# imports isn't included in the application timing.
+# imports isn't included in the application timing.)
+
+# Allow for torch application to be launched using any of:
+# mpiexec, srun, torchrun.
+if [[ -z "${LAUNCH_MODE}" ]]; then
+    LAUNCH_MODE="mpiexec"
+fi
+
 PYTHON_LAUNCH="python 5_diffusion_part2.py"
 PYTHON_IMPORT_LAUNCH="python -c 'import torch; import torchvision;'"
-if command -v mpiexec -help 1>/dev/null 2>&1; then
-    MPI_LAUNCH="mpiexec -n ${SLURM_NTASKS} "
-    MPI_IMPORT_LAUNCH="mpiexec -n ${SLURM_NNODES} "
-    if [[ $(mpiexec --version) == *"Open MPI"* ]]; then
-        MPI_LAUNCH+="-N ${SLURM_NTASKS_PER_NODE} --host ${HOSTS}"
-        MPI_IMPORT_LAUNCH+="-N 1 --host ${HOSTS}"
+TORCHRUN_LAUNCH="torchrun --nnodes ${SLURM_NNODES} --nproc_per_node ${SLURM_NTASKS_PER_NODE} --rdzv-backend=c10d --rdzv-endpoint=${DIST_URL}:${DIST_PORT} ./5_diffusion_part2.py"
+SRUN_LAUNCH="srun --nodes=${SLURM_NNODES} --ntasks-per-node=${SLURM_NTASKS_PER_NODE} --gres=gpu:${SLURM_GPUS_ON_NODE}"
+SRUN1_LAUNCH="srun --nodes=${SLURM_NNODES} --ntasks-per-node=1 --gres=gpu:${SLURM_GPUS_ON_NODE}"
+MPI_LAUNCH="mpiexec -n ${SLURM_NTASKS}"
+MPI1_LAUNCH="mpiexec -n ${SLURM_NNODES}"
+
+if [[ "torchrun" == "${LAUNCH_MODE}" ]]; then
+    if [[ "${SLURM_NNODES}" -gt 1 ]]; then
+        LAUNCH="${SRUN1_LAUNCH} ${TORCHRUN_LAUNCH}"
+	IMPORT_LAUNCH="${SRUN1_LAUNCH} ${PYTHON_IMPORT_LAUNCH}"
     else
-        MPI_LAUNCH+="-ppn ${SLURM_NTASKS_PER_NODE} --hosts ${HOSTS}"
-        MPI_IMPORT_LAUNCH+="-ppn 1 --hosts ${HOSTS}"
+        LAUNCH="${TORCHRUN_LAUNCH}"
+        IMPORT_LAUNCH="${PYTHON_IMPORT_LAUNCH}"
+    fi
+elif [[ "srun" == "${LAUNCH_MODE}" ]]; then
+    LAUNCH="${SRUN_LAUNCH} ${PYTHON_LAUNCH}"
+    IMPORT_LAUNCH="${SRUN1_LAUNCH} ${PYTHON_IMPORT_LAUNCH}"
+elif [[ "mpiexec" == "${LAUNCH_MODE}" ]]; then
+    if [[ $(mpiexec --version) == *"Open MPI"* ]]; then
+        HOSTS=$(echo "${HOSTS}" | tr "," "\n" | sed "s/$/:${SLURM_NTASKS_PER_NODE}/" | paste -sd,)
+        MPI_LAUNCH+=" -N ${SLURM_NTASKS_PER_NODE} --host ${HOSTS}"
+        MPI1_LAUNCH+=" -N 1 --host ${HOSTS}"
+    else
+        MPI_LAUNCH+=" -ppn ${SLURM_NTASKS_PER_NODE} --hosts ${HOSTS}"
+        MPI1_LAUNCH+=" -ppn 1 --hosts ${HOSTS}"
     fi
     LAUNCH="${MPI_LAUNCH} ${PYTHON_LAUNCH}"
-    echo ""
-    echo "Performing initial import of torch on each node"
-    T2=${SECONDS}
-    CMD="${MPI_IMPORT_LAUNCH} ${PYTHON_IMPORT_LAUNCH}"
-    echo "${CMD}"
-    eval "${CMD}"
-    echo "Import time 1: $((${SECONDS}-${T2})) seconds"
-    echo "Performing second import of torch on each node"
-    T2=${SECONDS}
-    echo "${CMD}"
-    eval "${CMD}"
-    echo "Import time 2: $((${SECONDS}-${T2})) seconds"
-else
-    LAUNCH=${PYTHON_LAUNCH}
-    echo ""
-    # Initial package import can be slow.  Perform before running
-    # application, so that the initial time isn't included in
-    # the application timing.
-    echo "Performing initial import of torch on each node"
-    T2=${SECONDS}
-    CMD="${PYTHON_IMPORT_LAUNCH}"
-    echo "${CMD}"
-    eval "${CMD}"
-    echo "Import time 1: $((${SECONDS}-${T2})) seconds"
-    echo "Performing second import of torch on each node"
-    T2=${SECONDS}
-    echo "${CMD}"
-    eval "${CMD}"
-    echo "Import time 2: $((${SECONDS}-${T2})) seconds"
+    IMPORT_LAUNCH="${MPI1_LAUNCH} ${PYTHON_IMPORT_LAUNCH}"
 fi
+
+# Initial package import can be slow.  Perform before running
+# application, so that the initial time isn't included in
+# the application timing.
+echo ""
+if [[ "${SLURM_NNODES}" -gt 1 ]]; then
+    IMPORT_INFO=" on each node"
+else
+    IMPORT_INFO=""
+fi
+echo "Performing initial import of torch${IMPORT_INFO}"
+T2=${SECONDS}
+CMD="${IMPORT_LAUNCH}"
+echo "${CMD}"
+eval "${CMD}"
+echo "Import time 1: $((${SECONDS}-${T2})) seconds"
+echo "Performing second import of torch${IMPORT_INFO}"
+T2=${SECONDS}
+echo "${CMD}"
+eval "${CMD}"
+echo "Import time 2: $((${SECONDS}-${T2})) seconds"
 
 # Define options to be passed to application.
 # Exclamation mark used to avoid forced exit (with set -e)
@@ -180,7 +207,7 @@ fi
  --dist-url ${DIST_URL}\
  --dist-port $(( (SLURM_JOB_ID % 10000) + 50000 ))\
  --cpus-per-task ${SLURM_CPUS_PER_TASK}\
- --epochs 400\
+ --epochs 2\
  --checkpoint-in no_checkpoint.pt\
  --checkpoint-out checkpoint400.pt\
  --checkpoint-interval 1\
@@ -196,7 +223,10 @@ EOS
 echo ""
 echo "Downloading/checking dataset"
 T3=${SECONDS}
-python -c "import torchvision as tv; tv.datasets.MNIST('../data', download=True)"
+CMD="python -c \"import torchvision as tv; tv.datasets.MNIST('../data', download=True)\""
+echo "${CMD}"
+eval ${CMD}
+echo ""
 echo "Time downloading/checking dataset: $((${SECONDS}-${T3})) seconds"
 
 # Run and time application.

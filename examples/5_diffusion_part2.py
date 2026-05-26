@@ -65,7 +65,7 @@ def main():
     args = parser.parse_args()
 
     # Get the data.
-    train_dataset, test_dataset = get_mnist(args.data_path)
+    train_dataset, test_dataset = get_mnist_datasets(args.data_path)
 
     # Get the model and optimizer
     unet = UNetSmol(input_channels=1,

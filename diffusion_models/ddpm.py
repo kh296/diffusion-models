@@ -15,7 +15,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.optim as optim
 from tqdm import tqdm
 
-from diffusion_models.utils import get_device_type, get_backend
+from diffusion_models.utils import(
+        get_device_type,
+        get_backend,
+        get_int_from_env,
+        )
 
 class DDPM:
     def __init__(self, model, optimizer, T: int, start: float, end: float,
@@ -95,8 +99,13 @@ class DDPM:
         if -1 == ntasks_per_node:
             ntasks_per_node = device_module.device_count()
 
-        self.world_size = int(os.environ.get("PMI_SIZE", 1))
-        self.rank = int(os.environ.get("PMI_RANK", 0))
+        self.world_size = get_int_from_env(
+            ["PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "WORLD_SIZE", "SLURM_NTASKS"],
+            1)
+
+        self.rank = get_int_from_env(
+            ["PMI_RANK", "OMPI_COMM_WORLD_RANK", "RANK", "SLURM_PROCID"], 0)
+
         self.local_world_size = ntasks_per_node
         self.local_rank = (
                 self.rank - ntasks_per_node * (self.rank // ntasks_per_node))
@@ -106,6 +115,7 @@ class DDPM:
 
         self.backend = get_backend(device_type) if self.world_size > 1 else None
         info = (f"host+device: {gethostname()}+{self.device}, "
+                f"backend: {self.backend}, "
                 f"world_size: {self.world_size}, "
                 f"rank: {self.rank}, local_rank: {self.local_rank}")
         if self.backend:
