@@ -100,11 +100,11 @@ class DDPM:
             ntasks_per_node = device_module.device_count()
 
         self.world_size = get_int_from_env(
-            ["PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "WORLD_SIZE", "SLURM_NTASKS"],
+            ["WORLD_SIZE", "PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "SLURM_NTASKS"],
             1)
 
         self.rank = get_int_from_env(
-            ["PMI_RANK", "OMPI_COMM_WORLD_RANK", "RANK", "SLURM_PROCID"], 0)
+            ["RANK", "PMI_RANK", "OMPI_COMM_WORLD_RANK", "SLURM_PROCID"], 0)
 
         self.local_world_size = ntasks_per_node
         self.local_rank = (
